@@ -5,7 +5,7 @@ use thiserror::Error;
 use url::{ParseError, Url};
 use uv_cache_key::{CacheKey, CacheKeyHasher};
 
-use uv_distribution_filename::{DistExtension, ExtensionError};
+use uv_distribution_filename::{DistExtension, ExtensionError, SourceDistExtension};
 use uv_git_types::{GitUrl, GitUrlParseError};
 use uv_pep508::{
     Pep508Url, UnnamedRequirementUrl, VerbatimUrl, VerbatimUrlError, looks_like_git_repository,
@@ -340,6 +340,17 @@ impl TryFrom<DisplaySafeUrl> for ParsedArchiveUrl {
             Err(..) if looks_like_git_repository(&url) => {
                 return Err(ParsedUrlError::MissingGitPrefix(url.to_string()));
             }
+            Err(..) if is_github_legacy_archive_url(&url) => {
+                // Handle GitHub legacy URLs like /tarball/ref and /zipball/ref
+                if url.path().contains("/tarball/") {
+                    DistExtension::Source(SourceDistExtension::TarGz)
+                } else if url.path().contains("/zipball/") {
+                    DistExtension::Source(SourceDistExtension::Zip)
+                } else {
+                    return Err(ParsedUrlError::MissingExtensionUrl(url.to_string(),
+                        ExtensionError::Dist));
+                }
+            }
             Err(err) => return Err(ParsedUrlError::MissingExtensionUrl(url.to_string(), err)),
         };
 
@@ -348,6 +359,30 @@ impl TryFrom<DisplaySafeUrl> for ParsedArchiveUrl {
             subdirectory,
             ext,
         })
+    }
+}
+
+/// Returns `true` if the URL is a GitHub legacy archive URL (tarball or zipball).
+///
+/// GitHub provides legacy URLs in the format:
+/// - `https://github.com/{owner}/{repo}/tarball/{ref}` for tar.gz files
+/// - `https://github.com/{owner}/{repo}/zipball/{ref}` for zip files
+pub fn is_github_legacy_archive_url(url: &Url) -> bool {
+    if url.host_str() != Some("github.com") {
+        return false;
+    }
+
+    let Some(path_segments) = url.path_segments() else {
+        return false;
+    };
+
+    let segments: Vec<&str> = path_segments.collect();
+
+    // Check for pattern: /{owner}/{repo}/tarball/{ref} or /{owner}/{repo}/zipball/{ref}
+    if segments.len() >= 4 {
+        matches!(segments[2], "tarball" | "zipball")
+    } else {
+        false
     }
 }
 
@@ -541,6 +576,7 @@ mod tests {
 
     use crate::parsed_url::ParsedUrl;
     use uv_redacted::DisplaySafeUrl;
+    use super::{DistExtension, SourceDistExtension};
 
     #[test]
     fn direct_url_from_url() -> Result<()> {
@@ -579,6 +615,47 @@ mod tests {
         let expected = DisplaySafeUrl::parse("file:///path/to/directory")?;
         let actual = DisplaySafeUrl::from(ParsedUrl::try_from(expected.clone())?);
         assert_eq!(expected, actual);
+        Ok(())
+    }
+
+    #[test]
+    fn github_legacy_urls() -> Result<()> {
+        use crate::parsed_url::{ParsedArchiveUrl, is_github_legacy_archive_url};
+
+        // Test GitHub legacy tarball URL
+        let tarball_url = DisplaySafeUrl::parse("https://github.com/openwisp/netjsonconfig/tarball/1.2")?;
+        assert!(is_github_legacy_archive_url(&tarball_url));
+        let parsed = ParsedArchiveUrl::try_from(tarball_url.clone())?;
+        assert_eq!(parsed.ext, DistExtension::Source(SourceDistExtension::TarGz));
+        assert_eq!(parsed.url, tarball_url);
+
+        // Test GitHub legacy zipball URL
+        let zipball_url = DisplaySafeUrl::parse("https://github.com/openwisp/netjsonconfig/zipball/main")?;
+        assert!(is_github_legacy_archive_url(&zipball_url));
+        let parsed = ParsedArchiveUrl::try_from(zipball_url.clone())?;
+        assert_eq!(parsed.ext, DistExtension::Source(SourceDistExtension::Zip));
+        assert_eq!(parsed.url, zipball_url);
+
+        // Test that it works as ParsedUrl too
+        let parsed_url = ParsedUrl::try_from(tarball_url)?;
+        if let ParsedUrl::Archive(archive) = parsed_url {
+            assert_eq!(archive.ext, DistExtension::Source(SourceDistExtension::TarGz));
+        } else {
+            panic!("Expected ParsedUrl::Archive");
+        }
+
+        // Test non-GitHub URLs are not detected
+        let gitlab_url = DisplaySafeUrl::parse("https://gitlab.com/user/repo/tarball/main")?;
+        assert!(!is_github_legacy_archive_url(&gitlab_url));
+
+        // Test regular GitHub URLs are not detected
+        let regular_github = DisplaySafeUrl::parse("https://github.com/user/repo")?;
+        assert!(!is_github_legacy_archive_url(&regular_github));
+
+        // Test GitHub archive URLs (not legacy) are not detected
+        let archive_url = DisplaySafeUrl::parse("https://github.com/user/repo/archive/main.tar.gz")?;
+        assert!(!is_github_legacy_archive_url(&archive_url));
+
         Ok(())
     }
 }
